@@ -19,3 +19,5 @@ add_executable(convert_to_lad convert_to_lad.cc)
 target_link_libraries(convert_to_lad PRIVATE cxxopts)
 
 add_executable(convert_dot_to_csv convert_dot_to_csv.cc)
+
+add_executable(convert_csv_to_dot convert_csv_to_dot.cc)
