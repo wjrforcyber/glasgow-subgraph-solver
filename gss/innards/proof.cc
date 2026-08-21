@@ -59,7 +59,10 @@ struct Proof::Imp
     map<tuple<long, long, long>, string> connected_variable_mappings;
     map<tuple<long, long, long, long>, string> connected_variable_mappings_aux;
     map<long, string> at_least_one_value_constraints, at_most_one_value_constraints, injectivity_constraints;
+    map<pair<long, long>, string> locally_injective_constraints;
+    bool locally_injective = false;
     map<tuple<long, long, long, long>, string> adjacency_lines;
+    map<tuple<long, long, long, long>, vector<long>> adjacency_permitted;
     map<pair<long, long>, long> eliminations;
     map<pair<long, long>, string> non_edge_constraints;
     long objective_line = 0;
@@ -85,7 +88,7 @@ struct Proof::Imp
 };
 
 Proof::Proof(const ProofOptions & options) :
-    _imp(new Imp)
+    _imp(make_unique<Imp>())
 {
     _imp->opb_filename = options.opb_file;
     _imp->log_filename = options.log_file;
@@ -146,6 +149,38 @@ auto Proof::create_injectivity_constraints(int pattern_size, int target_size,
     }
 }
 
+auto Proof::create_locally_injective_constraints(int pattern_size, int target_size,
+    const function<auto(int, int)->bool> & adjacent,
+    const function<auto(int)->string> & pattern_name,
+    const function<auto(int)->string> & target_name) -> void
+{
+    _imp->locally_injective = true;
+
+    for (int v = 0; v < pattern_size; ++v) {
+        // the neighbourhood of v: if v has a self-loop then v is its own neighbour, so
+        // local injectivity also forces phi(v) to differ from its neighbours' images.
+        vector<int> neighbours;
+        for (int u = 0; u < pattern_size; ++u)
+            if (adjacent(v, u))
+                neighbours.push_back(u);
+
+        // at most one neighbour maps to a given target only bites for |N(v)| >= 2
+        if (neighbours.size() < 2)
+            continue;
+
+        for (int t = 0; t < target_size; ++t) {
+            _imp->model_stream << "* local injectivity on neighbourhood of " << v << " for value " << t << '\n';
+            auto label = "@linj" + pattern_name(v) + "_" + target_name(t);
+            _imp->model_stream << label;
+            for (auto & u : neighbours)
+                _imp->model_stream << " -1 x" << _imp->variable_mappings[pair{u, t}];
+            _imp->model_stream << " >= -1 ;\n";
+            ++_imp->nb_constraints;
+            _imp->locally_injective_constraints.emplace(pair{v, t}, label);
+        }
+    }
+}
+
 auto Proof::create_forbidden_assignment_constraint(int p, int t) -> void
 {
     _imp->model_stream << "* forbidden assignment\n";
@@ -160,18 +195,74 @@ auto Proof::start_adjacency_constraints_for(int p, int t) -> void
 }
 
 auto Proof::create_adjacency_constraint(const NamedVertex & p, const NamedVertex & q, const NamedVertex & t,
-    const vector<int> & uu, const vector<int> & cancel, bool) -> void
+    const vector<int> & uu, bool) -> void
 {
     auto adj_label = "@adj" + p.second + "_" + t.second + "_" + q.second;
 
     _imp->model_stream << adj_label << " ";
     _imp->model_stream << "1 ~x" << _imp->variable_mappings[pair{p.first, t.first}];
     for (auto & u : uu)
-        if (cancel.end() == find(cancel.begin(), cancel.end(), u))
-            _imp->model_stream << " 1 x" << _imp->variable_mappings[pair{q.first, u}];
+        _imp->model_stream << " 1 x" << _imp->variable_mappings[pair{q.first, u}];
     _imp->model_stream << " >= 1 ;\n";
     ++_imp->nb_constraints;
     _imp->adjacency_lines.emplace(tuple{0, p.first, q.first, t.first}, adj_label);
+    _imp->adjacency_permitted.emplace(tuple{0, p.first, q.first, t.first}, vector<long>(uu.begin(), uu.end()));
+}
+
+auto Proof::loop_fix_adjacencies() -> void
+{
+    // Before issue #49 the adjacency constraint left the target's self-loop term out, so
+    // it could be summed into a pol cleanly. We now keep that term (so a loop->loop
+    // mapping satisfies the model), but it then appears as a stray "q maps to the loopy
+    // target" term in every pol. For each adjacency constraint over a loopy target t,
+    // rewrite its @adj label here to the loop-cancelled version -- ~x_p_t together with
+    // the neighbours of t other than t -- which follows from the constraint plus
+    // injectivity on t (mapping p to t forbids q from also mapping to t). VeriPB lets a
+    // proof line reassign an existing label, so every later reference to @adj in a pol
+    // picks up the loop-cancelled form automatically; the original loop-bearing
+    // constraint stays in the database (by number) so solutions still satisfy the model.
+    //
+    // The loop-cancelled form relies on global injectivity on t, which local injectivity
+    // does not give. But under local injectivity the pol-summing filters that would need
+    // it (degree/NDS/supplemental on loopy instances) are disabled anyway (issue #58), so
+    // no loop-cancelled adjacency is ever needed; skip the relabelling entirely.
+    if (_imp->locally_injective)
+        return;
+
+    for (auto & [key, label] : _imp->adjacency_lines) {
+        auto & [g, p, q, t] = key;
+        // a pattern self-loop edge (p == q) has its loop term pinned by at-most-one rather
+        // than injectivity, and is not summed into the supplemental/degree pols; skip it.
+        if (p == q)
+            continue;
+        auto pit = _imp->adjacency_permitted.find(key);
+        if (pit == _imp->adjacency_permitted.end())
+            continue;
+        if (find(pit->second.begin(), pit->second.end(), t) == pit->second.end())
+            continue; // t is not a neighbour of itself: no loop term to cancel
+        *_imp->proof_stream << label << " rup 1 ~x" << _imp->variable_mappings[pair{p, t}];
+        for (auto & u : pit->second)
+            if (u != t)
+                *_imp->proof_stream << " 1 x" << _imp->variable_mappings[pair{q, u}];
+        *_imp->proof_stream << " >= 1 ;\n";
+        ++_imp->proof_line;
+        // (The original loop-bearing constraint is now redundant, but it is left in place:
+        // deleting it needs `del id <number>`, and that number does not correspond to the
+        // same constraint in CakePB's independently-numbered OPB, so the deletion breaks
+        // the verified-pipeline elaboration. The extra constraint is cheap.)
+    }
+}
+
+auto Proof::emit_preserved_assignment_variables() -> void
+{
+    // List exactly the assignment variables as the projected (preserved) set,
+    // so VeriPB counts solutions in terms of the high-level mapping. The line
+    // goes into the prelude, which finalise_model writes immediately after the
+    // header and before any constraint.
+    _imp->model_prelude_stream << "preserved:";
+    for (auto & [_, name] : _imp->variable_mappings)
+        _imp->model_prelude_stream << " x" << name;
+    _imp->model_prelude_stream << " ;\n";
 }
 
 auto Proof::finalise_model() -> void
@@ -214,6 +305,28 @@ auto Proof::finish_sat_proof() -> void
     *_imp->proof_stream << "output NONE;\n"
         << "conclusion SAT;\n"
         << "end pseudo-Boolean proof;\n";
+}
+
+auto Proof::finish_enumeration_proof(const loooong & number_of_solutions, bool complete) -> void
+{
+    if (complete) {
+        // Every solution has been logged with solx and excluded, so the
+        // remaining problem is unsatisfiable: assert the contradiction and
+        // conclude a complete enumeration of exactly this many solutions.
+        *_imp->proof_stream << "% asserting that we've enumerated every solution\n";
+        *_imp->proof_stream << "rup >= 1 ;\n";
+        ++_imp->proof_line;
+        *_imp->proof_stream << "output NONE;\n"
+                            << "conclusion ENUMERATION_COMPLETE " << number_of_solutions << " : -1;\n"
+                            << "end pseudo-Boolean proof;\n";
+    }
+    else {
+        // We stopped early (timeout or solution limit): we have witnessed this
+        // many solutions but make no claim that there are no others.
+        *_imp->proof_stream << "output NONE;\n"
+                            << "conclusion ENUMERATION_PARTIAL " << number_of_solutions << ";\n"
+                            << "end pseudo-Boolean proof;\n";
+    }
 }
 
 auto Proof::finish_unknown_proof() -> void
@@ -287,9 +400,12 @@ auto Proof::incompatible_by_degrees(
         }
     }
 
-    // if I map p to t, I have to map the neighbours of p to neighbours of t
+    // if I map p to t, I have to map the neighbours of p to distinct neighbours of t.
+    // Under full injectivity that distinctness is the global injectivity on each value;
+    // under local injectivity it is the neighbourhood-injectivity of p (phi|N(p) is
+    // injective), which is exactly what the degree pigeonhole needs.
     for (auto & n : n_t)
-        *_imp->proof_stream << " " << _imp->injectivity_constraints[n] << " +";
+        *_imp->proof_stream << " " << (_imp->locally_injective ? _imp->locally_injective_constraints[pair{p.first, n}] : _imp->injectivity_constraints[n]) << " +";
 
     *_imp->proof_stream << " s ;\n";
     ++_imp->proof_line;
@@ -332,10 +448,13 @@ auto Proof::incompatible_by_nds(
         }
     }
 
-    // injectivity in the square
+    // injectivity in the square: each column of the square holds at most one of p's
+    // neighbours. Under full injectivity that is the global injectivity on the value;
+    // under local injectivity it is the neighbourhood-injectivity of p (at most one
+    // neighbour of p maps to t), exactly as in the degree pigeonhole above.
     for (auto & t : t_subsequence) {
         if (t != t_subsequence.back())
-            *_imp->proof_stream << " " << _imp->injectivity_constraints.at(t) << " +";
+            *_imp->proof_stream << " " << (_imp->locally_injective ? _imp->locally_injective_constraints.at(pair{p.first, t}) : _imp->injectivity_constraints.at(t)) << " +";
     }
 
     // block to the right of the failing square
@@ -365,11 +484,13 @@ auto Proof::incompatible_by_loops(
     const NamedVertex & p,
     const NamedVertex & t) -> void
 {
-    // if (_imp->recover_encoding) {
-        *_imp->proof_stream << "% cannot map " << p.second << " to " << t.second << " due to loop\n";
-        *_imp->proof_stream << "rup 1 ~x" << _imp->variable_mappings[pair{p.first, t.first}] << " >= 1 ;\n";
-        ++_imp->proof_line;
-    // }
+    // may be requested both up front (so the unit is available to later derivations and
+    // search propagations) and again during domain initialisation: only emit it once.
+    if (_imp->eliminations.contains(pair{p.first, t.first}))
+        return;
+    *_imp->proof_stream << "% cannot map " << p.second << " to " << t.second << " due to loop\n";
+    *_imp->proof_stream << "rup 1 ~x" << _imp->variable_mappings[pair{p.first, t.first}] << " >= 1 ;\n";
+    _imp->eliminations.emplace(pair{p.first, t.first}, ++_imp->proof_line);
 }
 
 auto Proof::initial_domain_is_empty(int p, const string & where) -> void
@@ -489,11 +610,22 @@ auto Proof::post_solution(const vector<pair<NamedVertex, NamedVertex>> & decisio
         *_imp->proof_stream << " " << var.second << "=" << val.second;
     *_imp->proof_stream << ";\n";
 
+    // Emit the solution-excluding (solx) rule at the top proof level. The
+    // blocking constraint it introduces must persist for the rest of the proof
+    // (so the solution count stays sound); if we logged it at the current deep
+    // search level, the wiplvl that cleans up this subtree on backtrack would
+    // delete it, weakening the guarantee.
+    if (0 != _imp->active_level)
+        *_imp->proof_stream << "setlvl 0;\n";
+
     *_imp->proof_stream << "solx";
     for (auto & [var, val] : decisions)
         *_imp->proof_stream << " x" << _imp->variable_mappings[pair{var.first, val.first}];
     *_imp->proof_stream << ";\n";
     ++_imp->proof_line;
+
+    if (0 != _imp->active_level)
+        *_imp->proof_stream << "setlvl " << _imp->active_level << ";\n";
 }
 
 auto Proof::post_solution(const vector<int> & solution) -> void
@@ -568,24 +700,31 @@ auto Proof::create_exact_path_graphs(
     for (auto & b : between_p_and_q) {
         for (auto & w : n_t) {
             // due to loops or labels, it might not be possible to map to w
-            auto i = _imp->adjacency_lines.find(tuple{0, b.first, q.first, w.first});
-            if (i != _imp->adjacency_lines.end())
-                *_imp->proof_stream << " " << i->second << " +";
+            if (_imp->adjacency_lines.contains(tuple{0, b.first, q.first, w.first}))
+                *_imp->proof_stream << " " << _imp->adjacency_lines.at(tuple{0, b.first, q.first, w.first}) << " +";
         }
     }
 
     *_imp->proof_stream << " s ;\n";
     ++_imp->proof_line;
 
-    // first tidy-up step: if p maps to t then q maps to something a two-walk away from t
+    // first tidy-up step: if p maps to t then q maps to something a two-walk away from t.
+    // The adjacency constraints summed above are the loop-cancelled forms, so there is no
+    // stray loop term and plain implication addition closes it.
     *_imp->proof_stream << "ia 1 ~x" << _imp->variable_mappings[pair{p.first, t.first}];
     for (auto & u : two_away_from_t)
         *_imp->proof_stream << " 1 x" << _imp->variable_mappings[pair{q.first, u.first.first}];
     *_imp->proof_stream << " >= 1 : " << _imp->proof_line << " ;\n";
     ++_imp->proof_line;
 
-    // if p maps to t then q does not map to t
-    *_imp->proof_stream << "pol " << _imp->proof_line << " " << _imp->injectivity_constraints[t.first] << " + s ;\n";
+    // if p maps to t then q does not map to t. Under full injectivity that is the global
+    // injectivity on t; under local injectivity p and q are not globally distinct, but they
+    // share a common neighbour b (that is what between_p_and_q holds), so both are in N(b),
+    // and the neighbourhood-injectivity of b forbids them both mapping to t. Either way the
+    // constraint cancels the "q maps to t" term, leaving the same tidy-up.
+    *_imp->proof_stream << "pol " << _imp->proof_line << " "
+                        << (_imp->locally_injective ? _imp->locally_injective_constraints.at(pair{between_p_and_q.front().first, t.first}) : _imp->injectivity_constraints[t.first])
+                        << " + s ;\n";
     ++_imp->proof_line;
 
     // and cancel out stray extras from injectivity
@@ -615,8 +754,13 @@ auto Proof::create_exact_path_graphs(
             *_imp->proof_stream << " " << _imp->at_most_one_value_constraints[b.first] << " +";
         }
 
+        // the between-vertices must map to distinct common neighbours of t and u (the z's).
+        // Under full injectivity that distinctness is global injectivity on each z; under
+        // local injectivity the between-vertices are all neighbours of p, so the
+        // neighbourhood-injectivity of p (at most one of N(p) maps to z) gives the same
+        // pigeonhole -- there are g between-vertices but fewer than g of the z's.
         for (auto & z : u.second)
-            *_imp->proof_stream << " " << _imp->injectivity_constraints[z.first] << " +";
+            *_imp->proof_stream << " " << (_imp->locally_injective ? _imp->locally_injective_constraints.at(pair{p.first, z.first}) : _imp->injectivity_constraints[z.first]) << " +";
 
         *_imp->proof_stream << " s ;\n";
         ++_imp->proof_line;

@@ -125,14 +125,16 @@ namespace
                 searcher.watches.clear_new_nogoods();
 
                 ++result.propagations;
-                if (searcher.propagate(true, domains, assignments, params.propagate_using_lackey != PropagateUsingLackey::Never)) {
+                if (searcher.propagate(true, domains, assignments)) {
                     auto assignments_copy = assignments;
 
                     switch (searcher.restarting_search(assignments_copy, domains, result.nodes, result.propagations,
                         result.solution_count, 0, *params.restarts_schedule)) {
                     case SearchResult::Satisfiable:
                         searcher.save_result(assignments_copy, result);
-                        result.complete = true;
+                        // when counting, reaching here means the enumerate callback asked
+                        // us to stop (e.g. a solution limit), so the search is not complete
+                        result.complete = ! params.count_solutions;
                         done = true;
                         break;
 
@@ -141,7 +143,6 @@ namespace
                         done = true;
                         break;
 
-                    case SearchResult::UnsatisfiableAndBackjumpUsingLackey:
                     case SearchResult::Unsatisfiable:
                         result.complete = true;
                         done = true;
@@ -312,7 +313,7 @@ namespace
                     }
 
                     ++thread_result.propagations;
-                    if (searchers[t]->propagate(true, domains, thread_assignments, params.propagate_using_lackey != PropagateUsingLackey::Never)) {
+                    if (searchers[t]->propagate(true, domains, thread_assignments)) {
                         auto assignments_copy = thread_assignments;
 
                         switch (searchers[t]->restarting_search(assignments_copy, domains, thread_result.nodes, thread_result.propagations,
@@ -331,7 +332,6 @@ namespace
                             break;
 
                         case SearchResult::Unsatisfiable:
-                        case SearchResult::UnsatisfiableAndBackjumpUsingLackey:
                             thread_result.complete = true;
                             params.timeout->trigger_early_abort();
                             searchers[t]->watches.post_nogood(Nogood<HomomorphismAssignment>{});
@@ -417,15 +417,12 @@ auto gss::solve_homomorphism_problem(
             throw UnsupportedConfiguration{"Proof logging cannot yet be used with threads"};
         if (params.clique_detection)
             throw UnsupportedConfiguration{"Proof logging cannot yet be used with clique detection, use --no-clique-detection"};
-        if (params.lackey)
-            throw UnsupportedConfiguration{"Proof logging cannot yet be used with a lackey"};
         if (! params.pattern_less_constraints.empty() || ! params.target_occur_less_constraints.empty())
             throw UnsupportedConfiguration{"Proof logging cannot yet be used with less-constraints"};
-        if (params.injectivity != Injectivity::Injective && params.injectivity != Injectivity::NonInjective)
-            throw UnsupportedConfiguration{"Proof logging can currently only be used with injectivity or non-injectivity"};
         if (pattern.has_vertex_labels() || pattern.has_edge_labels())
             throw UnsupportedConfiguration{"Proof logging cannot yet be used on labelled graphs"};
-
+        if (params.count_solutions && params.restarts_schedule && params.restarts_schedule->might_restart())
+            throw UnsupportedConfiguration{"Proof logging cannot yet be used when counting with restarts, use --restarts none"};
         proof = make_shared<Proof>(*params.proof_options);
 
         // set up our model file, with a set of OPB variables for each CP variable
@@ -440,6 +437,14 @@ auto gss::solve_homomorphism_problem(
         if (params.injectivity == Injectivity::Injective)
             proof->create_injectivity_constraints(pattern.size(), target.size(),
                 [&](int v) { return target.vertex_name(v); });
+        else if (params.injectivity == Injectivity::LocallyInjective)
+            // local injectivity: for each pattern vertex and each target, at most one of
+            // that vertex's neighbours may map there (so phi restricted to a neighbourhood
+            // is injective). The neighbourhood analogue of the injectivity constraints.
+            proof->create_locally_injective_constraints(pattern.size(), target.size(),
+                [&](int a, int b) { return pattern.adjacent(a, b); },
+                [&](int v) { return pattern.vertex_name(v); },
+                [&](int v) { return target.vertex_name(v); });
 
         // generate edge constraints, and also handle loops here
         for (int p = 0; p < pattern.size(); ++p) {
@@ -451,42 +456,78 @@ auto gss::solve_homomorphism_problem(
                 // if p can be mapped to t, then each neighbour of p...
                 for (int q = 0; q < pattern.size(); ++q)
                     if (pattern.adjacent(p, q)) {
-                        // ... must be mapped to a neighbour of t
-                        vector<int> permitted, cancel_out;
+                        // ... must be mapped to a neighbour of t. A target self-loop
+                        // (u == t) is kept in the sum, so a loop-preserving mapping
+                        // satisfies the constraint (this matches the verified CakePB
+                        // encoding; see issue #49).
+                        vector<int> permitted;
                         for (int u = 0; u < target.size(); ++u)
-                            if (target.adjacent(t, u)) {
+                            if (target.adjacent(t, u))
                                 permitted.push_back(u);
-                                if (t == u)
-                                    cancel_out.push_back(t);
-                            }
                         proof->create_adjacency_constraint(
                             NamedVertex{p, pattern.vertex_name(p)},
                             NamedVertex{q, pattern.vertex_name(q)},
                             NamedVertex{t, target.vertex_name(t)},
-                            permitted, cancel_out, false);
+                            permitted, false);
                     }
 
                 // same for non-adjacency for induced
                 if (params.induced) {
                     for (int q = 0; q < pattern.size(); ++q)
                         if (q != p && ! pattern.adjacent(p, q)) {
-                            // ... must be mapped to a neighbour of t
+                            // ... must be mapped to a non-neighbour of t. t itself counts as
+                            // a non-neighbour exactly when it has no self-loop, so the
+                            // permitted set is just the non-neighbours of t (the same test
+                            // the q == p case below uses). Under full injectivity q cannot
+                            // share t with p anyway, so whether t is in the set is moot; but
+                            // under local injectivity p and q may both map to a loopless t,
+                            // and that is a legitimate induced non-edge (t is not adjacent to
+                            // itself), so t must stay in the set or the model wrongly rejects
+                            // it.
                             vector<int> permitted;
                             for (int u = 0; u < target.size(); ++u)
-                                if (t != u && ! target.adjacent(t, u))
+                                if (! target.adjacent(t, u))
                                     permitted.push_back(u);
                             proof->create_adjacency_constraint(
                                 NamedVertex{p, pattern.vertex_name(p)},
                                 NamedVertex{q, pattern.vertex_name(q)},
                                 NamedVertex{t, target.vertex_name(t)},
-                                permitted, vector<int>{}, true);
+                                permitted, true);
                         }
+
+                    // the q == p case of non-edge preservation: a non-loopy pattern
+                    // vertex cannot map to a loopy target, since induced isomorphism
+                    // requires loop(p) == loop(t). The loop above skips q == p, and the
+                    // edge loop only constrains a loopy p, so without this the model
+                    // admits invalid induced mappings (issue #56). p -> t then forces p
+                    // onto a non-neighbour of t; with t a neighbour of itself and
+                    // at-most-one-value, that is a contradiction.
+                    if (! pattern.adjacent(p, p) && target.adjacent(t, t)) {
+                        vector<int> permitted;
+                        for (int u = 0; u < target.size(); ++u)
+                            if (! target.adjacent(t, u))
+                                permitted.push_back(u);
+                        proof->create_adjacency_constraint(
+                            NamedVertex{p, pattern.vertex_name(p)},
+                            NamedVertex{p, pattern.vertex_name(p)},
+                            NamedVertex{t, target.vertex_name(t)},
+                            permitted, true);
+                    }
                 }
             }
         }
 
+        // declare the projected set (the assignment variables) so the proof's
+        // solution count is in terms of the high-level mapping
+        proof->emit_preserved_assignment_variables();
+
         // output the model file
         proof->finalise_model();
+
+        // derive the loop-cancelled form of each loopy adjacency constraint, so the
+        // degree, supplemental-graph and distance-3 derivations can sum them into pols
+        // without a stray "maps to the loopy target" term (issue #56).
+        proof->loop_fix_adjacencies();
     }
 
     // first sanity check: if we're finding an injective mapping, and there
@@ -494,7 +535,10 @@ auto gss::solve_homomorphism_problem(
     if (is_nonshrinking(params) && (pattern.size() > target.size())) {
         if (proof) {
             proof->failure_due_to_pattern_bigger_than_target();
-            proof->finish_unsat_proof();
+            if (params.count_solutions)
+                proof->finish_enumeration_proof(0, true);
+            else
+                proof->finish_unsat_proof();
         }
 
         return HomomorphismResult{};
@@ -553,8 +597,12 @@ auto gss::solve_homomorphism_problem(
             HomomorphismResult result;
             result.extra_stats.emplace_back("model_consistent = false");
             result.complete = true;
-            if (proof)
-                proof->finish_unsat_proof();
+            if (proof) {
+                if (params.count_solutions)
+                    proof->finish_enumeration_proof(0, true);
+                else
+                    proof->finish_unsat_proof();
+            }
             return result;
         }
 
@@ -573,7 +621,11 @@ auto gss::solve_homomorphism_problem(
         }
 
         if (proof) {
-            if (result.complete && result.mapping.empty())
+            if (params.count_solutions)
+                // counting / enumeration: a complete search yields ENUMERATION_COMPLETE,
+                // otherwise (timeout or solution limit) ENUMERATION_PARTIAL
+                proof->finish_enumeration_proof(result.solution_count, result.complete);
+            else if (result.complete && result.mapping.empty())
                 proof->finish_unsat_proof();
             else if (! result.mapping.empty())
                 proof->finish_sat_proof();

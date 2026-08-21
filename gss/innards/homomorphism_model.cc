@@ -40,13 +40,13 @@ using std::chrono::steady_clock;
 
 namespace
 {
-    auto calculate_n_shape_graphs(const HomomorphismParams & params) -> unsigned
+    auto calculate_n_shape_graphs(const HomomorphismParams & params, bool has_loops) -> unsigned
     {
         return 1 +
-            (supports_exact_path_graphs(params) ? params.number_of_exact_path_graphs : 0) +
-            (supports_distance2_graphs(params) ? 1 : 0) +
+            (supports_exact_path_graphs(params, has_loops) ? params.number_of_exact_path_graphs : 0) +
+            (supports_distance2_graphs(params, has_loops) ? 1 : 0) +
             (supports_distance3_graphs(params) ? 1 : 0) +
-            (supports_k4_graphs(params) ? 1 : 0) +
+            (supports_k4_graphs(params, has_loops) ? 1 : 0) +
             params.extra_shapes.size();
     }
 
@@ -126,6 +126,7 @@ struct HomomorphismModel::Imp
 
     vector<int> pattern_vertex_labels, target_vertex_labels, pattern_edge_labels, target_edge_labels;
     vector<int> pattern_loops, target_loops;
+    bool has_loops = false;
 
     vector<string> pattern_vertex_proof_names, target_vertex_proof_names;
 
@@ -148,11 +149,13 @@ struct HomomorphismModel::Imp
 
 HomomorphismModel::HomomorphismModel(const InputGraph & target, const InputGraph & pattern, const HomomorphismParams & params,
     const std::shared_ptr<Proof> & proof) :
-    _imp(new Imp(params, proof)),
-    max_graphs(calculate_n_shape_graphs(params)),
+    _imp(make_unique<Imp>(params, proof)),
+    max_graphs(calculate_n_shape_graphs(params, pattern.loopy() || target.loopy())),
     pattern_size(pattern.size()),
     target_size(target.size())
 {
+    _imp->has_loops = pattern.loopy() || target.loopy();
+
     if (_imp->params.clique_size_constraints)
         _imp->max_graphs_for_clique_size_constraints = (_imp->params.clique_size_constraints_on_supplementals ? max_graphs : 1);
 
@@ -496,7 +499,7 @@ auto HomomorphismModel::_check_degree_compatibility(
     vector<vector<optional<vector<int>>>> & targets_ndss,
     bool do_not_do_nds_yet) const -> bool
 {
-    if (! degree_and_nds_are_preserved(_imp->params))
+    if (! degree_and_nds_are_preserved(_imp->params, _imp->has_loops))
         return true;
 
     for (unsigned g = 0; g < graphs_to_consider; ++g) {
@@ -595,7 +598,7 @@ auto HomomorphismModel::initialise_domains(vector<HomomorphismDomain> & domains)
     vector<vector<vector<int>>> patterns_ndss(max_graphs_for_degree_things);
     vector<vector<optional<vector<int>>>> targets_ndss(max_graphs_for_degree_things);
 
-    if (degree_and_nds_are_preserved(_imp->params) && ! _imp->params.no_nds) {
+    if (degree_and_nds_are_preserved(_imp->params, _imp->has_loops) && ! _imp->params.no_nds) {
         for (unsigned g = 0; g < max_graphs_for_degree_things; ++g) {
             patterns_ndss.at(g).resize(pattern_size);
             targets_ndss.at(g).resize(target_size);
@@ -642,7 +645,7 @@ auto HomomorphismModel::initialise_domains(vector<HomomorphismDomain> & domains)
     }
 
     // for proof logging, we need degree information before we can output nds proofs
-    if (_imp->proof && degree_and_nds_are_preserved(_imp->params) && ! _imp->params.no_nds) {
+    if (_imp->proof && degree_and_nds_are_preserved(_imp->params, _imp->has_loops) && ! _imp->params.no_nds) {
         for (unsigned i = 0; i < pattern_size; ++i) {
             for (unsigned j = 0; j < target_size; ++j) {
                 if (domains.at(i).values.test(j) &&
@@ -689,27 +692,6 @@ auto HomomorphismModel::initialise_domains(vector<HomomorphismDomain> & domains)
         }
     }
 
-    if (_imp->params.lackey) {
-        // If we're dealing with a model from Essence, it's possible some values will
-        // be completely eliminated from the upper and lower bounds of certain domains,
-        // in which case they won't show up as being deleted during propagation.
-        bool wipeout = false;
-        if (! _imp->params.lackey->reduce_initial_bounds([&](int p, int t) -> void {
-                for (auto & d : domains)
-                    if (d.v == unsigned(p)) {
-                        if (d.values.test(t)) {
-                            d.values.reset(t);
-                            if (0 == --d.count)
-                                wipeout = true;
-                        }
-                        break;
-                    }
-            }) ||
-            wipeout) {
-            return false;
-        }
-    }
-
     return true;
 }
 
@@ -733,6 +715,20 @@ auto HomomorphismModel::prepare() -> bool
         return false;
 
     _imp->supplemental_graph_names.push_back("original");
+
+    // Emit every loop-based incompatibility up front, as a unit clause. The target graph
+    // rows have self-loops stripped, so the adjacency, supplemental-graph and degree
+    // derivations all carry stray "maps to a loopy vertex" terms; having ~x_p_t available
+    // as a unit lets unit propagation (and the search-failure rups) discharge them. This
+    // also covers the induced loop-mismatch case, which otherwise prunes p->t silently
+    // without a proof line (issue #56).
+    if (_imp->proof) {
+        for (unsigned p = 0; p < pattern_size; ++p)
+            for (unsigned t = 0; t < target_size; ++t)
+                if ((pattern_has_loop(p) && ! target_has_loop(t)) ||
+                    (_imp->params.induced && (pattern_has_loop(p) != target_has_loop(t))))
+                    _imp->proof->incompatible_by_loops(pattern_vertex_for_proof(p), target_vertex_for_proof(t));
+    }
 
     // pattern and target degrees, for the main graph
     _imp->patterns_degrees.at(0).resize(pattern_size);
@@ -792,7 +788,7 @@ auto HomomorphismModel::prepare() -> bool
 
     unsigned next_pattern_supplemental = 1, next_target_supplemental = 1;
     // build exact path graphs
-    if (supports_exact_path_graphs(_imp->params)) {
+    if (supports_exact_path_graphs(_imp->params, _imp->has_loops)) {
         _build_exact_path_graphs(_imp->pattern_graph_rows, pattern_size, next_pattern_supplemental, _imp->params.number_of_exact_path_graphs, _imp->directed, false, true);
         _build_exact_path_graphs(_imp->target_graph_rows, target_size, next_target_supplemental, _imp->params.number_of_exact_path_graphs, _imp->directed, false, false);
 
@@ -855,7 +851,7 @@ auto HomomorphismModel::prepare() -> bool
         }
     }
 
-    if (supports_distance2_graphs(_imp->params)) {
+    if (supports_distance2_graphs(_imp->params, _imp->has_loops)) {
         _build_exact_path_graphs(_imp->pattern_graph_rows, pattern_size, next_pattern_supplemental, 1, _imp->directed, true, true);
         _build_exact_path_graphs(_imp->target_graph_rows, target_size, next_target_supplemental, 1, _imp->directed, true, false);
     }
@@ -959,7 +955,7 @@ auto HomomorphismModel::prepare() -> bool
         }
     }
 
-    if (supports_k4_graphs(_imp->params)) {
+    if (supports_k4_graphs(_imp->params, _imp->has_loops)) {
         _build_k4_graphs(_imp->pattern_graph_rows, pattern_size, next_pattern_supplemental, true);
         _build_k4_graphs(_imp->target_graph_rows, target_size, next_target_supplemental, false);
     }

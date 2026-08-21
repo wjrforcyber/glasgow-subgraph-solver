@@ -2,6 +2,7 @@
 #define GLASGOW_SUBGRAPH_SOLVER_GUARD_SRC_PROOF_HH 1
 
 #include <gss/innards/proof-fwd.hh>
+#include <gss/loooong.hh>
 #include <gss/proof_options.hh>
 
 #include <exception>
@@ -57,10 +58,29 @@ namespace gss::innards
         auto create_injectivity_constraints(int pattern_size, int target_size,
             const std::function<auto(int)->std::string> & target_name) -> void;
 
+        // Local-injectivity analogue: for each pattern vertex v and target t, at most one
+        // neighbour of v maps to t (phi restricted to N(v) is injective).
+        auto create_locally_injective_constraints(int pattern_size, int target_size,
+            const std::function<auto(int, int)->bool> & adjacent,
+            const std::function<auto(int)->std::string> & pattern_name,
+            const std::function<auto(int)->std::string> & target_name) -> void;
+
         auto create_forbidden_assignment_constraint(int p, int t) -> void;
         auto start_adjacency_constraints_for(int p, int t) -> void;
         auto create_adjacency_constraint(const NamedVertex & p, const NamedVertex & q, const NamedVertex & t,
-            const std::vector<int> & u, const std::vector<int> & cancel_out, bool induced) -> void;
+            const std::vector<int> & u, bool induced) -> void;
+
+        // For every adjacency constraint over a loopy target, derive its loop-cancelled
+        // form (the pre-#49 encoding) once, so that derivations can sum it into a pol
+        // without dragging in the stray "maps to the loopy target" term. Must be called
+        // after finalise_model and before any derivation that sums adjacency constraints.
+        auto loop_fix_adjacencies() -> void;
+
+        // Declare a projected (preserved) set, listing exactly the assignment
+        // variables, so the proof's solution count is in terms of the high-level
+        // mapping rather than any auxiliary encoding variables. Must be called
+        // after all create_cp_variable calls but before finalise_model.
+        auto emit_preserved_assignment_variables() -> void;
 
         auto finalise_model() -> void;
 
@@ -69,6 +89,10 @@ namespace gss::innards
         auto finish_sat_proof() -> void;
         auto finish_unknown_proof() -> void;
         auto finish_optimisation_proof(int size) -> void;
+
+        // Conclude a counting / enumeration proof: ENUMERATION_COMPLETE if the
+        // whole search space was exhausted, otherwise ENUMERATION_PARTIAL.
+        auto finish_enumeration_proof(const loooong & number_of_solutions, bool complete) -> void;
 
         // top of search failures
         auto failure_due_to_pattern_bigger_than_target() -> void;
